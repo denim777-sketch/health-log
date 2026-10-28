@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
@@ -23,6 +24,8 @@ import androidx.health.connect.client.records.DistanceRecord
 import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.SleepSessionRecord
+import androidx.health.connect.client.records.WeightRecord
+import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.request.AggregateRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
@@ -44,7 +47,8 @@ class MainActivity : ComponentActivity() {
     private val distancePerm = HealthPermission.getReadPermission(DistanceRecord::class)
     // 30日より前の記録を読むための許可
     private val historyPerm = "android.permission.health.READ_HEALTH_DATA_HISTORY"
-    private val allPerms = setOf(sleepPerm, exercisePerm, distancePerm, historyPerm)
+    private val weightPerm = HealthPermission.getReadPermission(WeightRecord::class)
+    private val allPerms = setOf(sleepPerm, exercisePerm, distancePerm, historyPerm, weightPerm)
 
     private val zone: ZoneId = ZoneId.systemDefault()
     private val timeFmt = DateTimeFormatter.ofPattern("H:mm")
@@ -60,7 +64,10 @@ class MainActivity : ComponentActivity() {
     private var sleeps: List<SleepSessionRecord> = emptyList()
     private var exercises: List<ExerciseSessionRecord> = emptyList()
     private var distances: Map<String, Double> = emptyMap()
+    private var weights: List<WeightRecord> = emptyList()
     private var hasHistory = true
+    private var hasWeight = true
+    private val sourceNames = mutableMapOf<String, String>()
     private var loaded = false
     private var showMonthly = false
 
@@ -79,6 +86,7 @@ class MainActivity : ComponentActivity() {
     private val lineColor get() = if (isDark) Color.parseColor("#33383E") else Color.parseColor("#DDE1E5")
     private val sleepColor = Color.parseColor("#6C7FD8")
     private val runColor = Color.parseColor("#E07A3F")
+    private val weightColor = Color.parseColor("#3FA77A")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -180,6 +188,7 @@ class MainActivity : ComponentActivity() {
                 }
                 showMessage("読み込み中…")
                 hasHistory = granted.contains(historyPerm)
+                hasWeight = granted.contains(weightPerm)
 
                 // 今月を含めて12ヵ月前の1日から
                 val end = Instant.now()
@@ -188,6 +197,7 @@ class MainActivity : ComponentActivity() {
 
                 sleeps = readAll(hc, SleepSessionRecord::class, range)
                 exercises = readAll(hc, ExerciseSessionRecord::class, range)
+                weights = if (hasWeight) readAll(hc, WeightRecord::class, range) else emptyList()
 
                 val dist = mutableMapOf<String, Double>()
                 if (granted.contains(distancePerm)) {
@@ -240,7 +250,8 @@ class MainActivity : ComponentActivity() {
         val runs: Int,
         val runKm: Double,
         val workouts: Int,
-        val workoutMin: Long
+        val workoutMin: Long,
+        val avgWeight: Double?
     )
 
     /** 睡眠は「起きた日」、運動は「始めた日」が from〜to に入るものを集計 */
@@ -257,7 +268,9 @@ class MainActivity : ComponentActivity() {
             runs = runs.size,
             runKm = runs.sumOf { distances[it.metadata.id] ?: 0.0 },
             workouts = ex.size,
-            workoutMin = ex.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
+            workoutMin = ex.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() },
+            avgWeight = weights.filter { inRange(it.time.atZone(zone).toLocalDate()) }
+                .map { it.weight.inKilograms }.takeIf { it.isNotEmpty() }?.average()
         )
     }
 
@@ -276,14 +289,26 @@ class MainActivity : ComponentActivity() {
         sum.addView(compareRow("ラン回数", "${s7.runs}回", "${s30.runs}回"))
         sum.addView(compareRow("ラン距離", fmtKm(s7.runKm), fmtKm(s30.runKm)))
         sum.addView(compareRow("運動時間", fmtMinutes(s7.workoutMin), fmtMinutes(s30.workoutMin)))
+        sum.addView(compareRow("平均体重", fmtKg(s7.avgWeight), fmtKg(s30.avgWeight)))
         list.addView(sum)
+
+        if (!hasWeight) {
+            list.addView(Button(this).apply {
+                text = "体重の読み取りを許可"
+                setOnClickListener { requestPermissions.launch(allPerms) }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(10) })
+        }
 
         val from = today.minusDays(29)
         val sleepByDay = sleeps.groupBy { it.endTime.atZone(zone).toLocalDate() }
             .filterKeys { !it.isBefore(from) }
         val exByDay = exercises.groupBy { it.startTime.atZone(zone).toLocalDate() }
             .filterKeys { !it.isBefore(from) }
-        val days = (sleepByDay.keys + exByDay.keys).sortedDescending()
+        val weightByDay = weights.groupBy { it.time.atZone(zone).toLocalDate() }
+            .filterKeys { !it.isBefore(from) }
+        val days = (sleepByDay.keys + exByDay.keys + weightByDay.keys).sortedDescending()
 
         if (days.isEmpty()) {
             list.addView(note(
@@ -301,6 +326,7 @@ class MainActivity : ComponentActivity() {
                 setTypeface(typeface, Typeface.BOLD)
                 setTextColor(mainColor)
             })
+            weightByDay[day].orEmpty().sortedBy { it.time }.forEach { c.addView(weightRow(it)) }
             sleepByDay[day].orEmpty().sortedBy { it.startTime }.forEach { c.addView(sleepRow(it)) }
             exByDay[day].orEmpty().sortedBy { it.startTime }.forEach {
                 c.addView(exerciseRow(it, distances[it.metadata.id]))
@@ -334,7 +360,8 @@ class MainActivity : ComponentActivity() {
         sum.addView(TextView(this).apply {
             text = "ランニング  ${total.runs}回・${fmtKm(total.runKm)}\n" +
                 "運動  ${total.workouts}回・${fmtMinutes(total.workoutMin)}\n" +
-                "平均睡眠  ${fmtSleep(total)}"
+                "平均睡眠  ${fmtSleep(total)}" +
+                (if (total.avgWeight != null) "\n平均体重  ${fmtKg(total.avgWeight)}" else "")
             textSize = 16f
             setTextColor(mainColor)
             setLineSpacing(dp(4).toFloat(), 1f)
@@ -353,7 +380,7 @@ class MainActivity : ComponentActivity() {
                 setTypeface(typeface, Typeface.BOLD)
                 setTextColor(mainColor)
             })
-            if (s.nights == 0 && s.workouts == 0) {
+            if (s.nights == 0 && s.workouts == 0 && s.avgWeight == null) {
                 c.addView(TextView(this).apply {
                     text = "記録なし"
                     textSize = 13f
@@ -365,6 +392,9 @@ class MainActivity : ComponentActivity() {
                     "運動合計 ${s.workouts}回・${fmtMinutes(s.workoutMin)}"))
                 c.addView(row(sleepColor, "睡眠  平均${fmtSleep(s)}",
                     "記録 ${s.nights}日"))
+                if (s.avgWeight != null) {
+                    c.addView(row(weightColor, "体重  平均${fmtKg(s.avgWeight)}", ""))
+                }
             }
             list.addView(c)
         }
@@ -388,6 +418,7 @@ class MainActivity : ComponentActivity() {
                     (if (awake > 0) " ・ 覚醒 ${fmtMinutes(awake)}" else "")
             }
         }
+        detail += "\n" + sourceName(s.metadata)
         return row(sleepColor, "睡眠  ${fmtMinutes(asleepMinutes(s))}", detail)
     }
 
@@ -403,7 +434,27 @@ class MainActivity : ComponentActivity() {
                 detail += String.format(Locale.JAPAN, " ・ %d'%02d\"/km", paceSec / 60, paceSec % 60)
             }
         }
+        detail += "\n" + sourceName(e.metadata)
         return row(runColor, "${exerciseName(e.exerciseType)}  ${fmtMinutes(mins)}", detail)
+    }
+
+    private fun weightRow(w: WeightRecord): View {
+        val t = w.time.atZone(zone).format(timeFmt)
+        return row(weightColor, "体重  ${fmtKg(w.weight.inKilograms)}", "$t\n" + sourceName(w.metadata))
+    }
+
+    /** 記録を書き込んだアプリの名前（分からなければパッケージ名） */
+    private fun sourceName(m: Metadata): String {
+        val pkg = m.dataOrigin.packageName
+        val name = sourceNames.getOrPut(pkg) {
+            try {
+                val info = packageManager.getApplicationInfo(pkg, 0)
+                packageManager.getApplicationLabel(info).toString()
+            } catch (e: PackageManager.NameNotFoundException) {
+                pkg
+            }
+        }
+        return "データ元：$name"
     }
 
     /** 覚醒時間を除いた睡眠時間（段階データがなければ全体） */
@@ -448,6 +499,9 @@ class MainActivity : ComponentActivity() {
         if (min >= 60) "${min / 60}時間${min % 60}分" else "${min}分"
 
     private fun fmtSleep(s: Stats) = if (s.nights > 0) fmtMinutes(s.avgSleepMin) else "—"
+
+    private fun fmtKg(kg: Double?) =
+        if (kg == null) "—" else String.format(Locale.JAPAN, "%.1f kg", kg)
 
     private fun fmtKm(km: Double) = String.format(Locale.JAPAN, "%.1f km", km)
 
@@ -502,6 +556,7 @@ class MainActivity : ComponentActivity() {
         })
         texts.addView(TextView(this).apply {
             text = detail
+            if (detail.isEmpty()) visibility = View.GONE
             textSize = 13f
             setTextColor(subColor)
         })
