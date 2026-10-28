@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.denim.healthlog"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.denim.healthlog"
