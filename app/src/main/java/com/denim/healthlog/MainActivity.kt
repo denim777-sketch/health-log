@@ -21,6 +21,7 @@ import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.DistanceRecord
 import androidx.health.connect.client.records.ExerciseSessionRecord
+import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.SleepSessionRecord
 import androidx.health.connect.client.request.AggregateRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
@@ -30,24 +31,38 @@ import kotlinx.coroutines.launch
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
+import java.time.YearMonth
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import java.time.temporal.ChronoUnit
 import java.util.Locale
+import kotlin.reflect.KClass
 
 class MainActivity : ComponentActivity() {
 
     private val sleepPerm = HealthPermission.getReadPermission(SleepSessionRecord::class)
     private val exercisePerm = HealthPermission.getReadPermission(ExerciseSessionRecord::class)
     private val distancePerm = HealthPermission.getReadPermission(DistanceRecord::class)
-    private val allPerms = setOf(sleepPerm, exercisePerm, distancePerm)
+    // 30日より前の記録を読むための許可
+    private val historyPerm = "android.permission.health.READ_HEALTH_DATA_HISTORY"
+    private val allPerms = setOf(sleepPerm, exercisePerm, distancePerm, historyPerm)
 
     private val zone: ZoneId = ZoneId.systemDefault()
     private val timeFmt = DateTimeFormatter.ofPattern("H:mm")
     private val dayFmt = DateTimeFormatter.ofPattern("M月d日（E）", Locale.JAPANESE)
+    private val monthFmt = DateTimeFormatter.ofPattern("yyyy年M月", Locale.JAPANESE)
 
     private lateinit var list: LinearLayout
+    private lateinit var dailyTab: Button
+    private lateinit var monthlyTab: Button
     private var client: HealthConnectClient? = null
+
+    // 読み込んだデータ（タブ切り替えで使い回す）
+    private var sleeps: List<SleepSessionRecord> = emptyList()
+    private var exercises: List<ExerciseSessionRecord> = emptyList()
+    private var distances: Map<String, Double> = emptyMap()
+    private var hasHistory = true
+    private var loaded = false
+    private var showMonthly = false
 
     private val requestPermissions =
         registerForActivityResult(PermissionController.createRequestPermissionResultContract()) {
@@ -61,6 +76,7 @@ class MainActivity : ComponentActivity() {
     private val cardColor get() = if (isDark) Color.parseColor("#22262B") else Color.parseColor("#F2F4F6")
     private val subColor get() = if (isDark) Color.parseColor("#9AA3AD") else Color.parseColor("#66707A")
     private val mainColor get() = if (isDark) Color.parseColor("#ECEFF2") else Color.parseColor("#1D2329")
+    private val lineColor get() = if (isDark) Color.parseColor("#33383E") else Color.parseColor("#DDE1E5")
     private val sleepColor = Color.parseColor("#6C7FD8")
     private val runColor = Color.parseColor("#E07A3F")
 
@@ -85,6 +101,24 @@ class MainActivity : ComponentActivity() {
         })
         root.addView(header)
 
+        // 「日別」「月別」の切り替え
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(12), 0, dp(12), 0)
+        }
+        dailyTab = Button(this).apply {
+            text = "日別（30日）"
+            setOnClickListener { showMonthly = false; refreshView() }
+        }
+        monthlyTab = Button(this).apply {
+            text = "月別（12ヵ月）"
+            setOnClickListener { showMonthly = true; refreshView() }
+        }
+        tabs.addView(dailyTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        tabs.addView(monthlyTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(tabs)
+        updateTabs()
+
         list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(4), dp(12), dp(24))
@@ -101,6 +135,18 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
 
         start()
+    }
+
+    private fun updateTabs() {
+        dailyTab.alpha = if (showMonthly) 0.5f else 1f
+        monthlyTab.alpha = if (showMonthly) 1f else 0.5f
+    }
+
+    private fun refreshView() {
+        updateTabs()
+        if (loaded) {
+            if (showMonthly) renderMonthly() else renderDaily()
+        }
     }
 
     private fun start() {
@@ -124,24 +170,28 @@ class MainActivity : ComponentActivity() {
             try {
                 val granted = hc.permissionController.getGrantedPermissions()
                 if (!granted.contains(sleepPerm) || !granted.contains(exercisePerm)) {
+                    loaded = false
                     showMessage(
-                        "睡眠と運動の記録を読むには、ヘルスコネクトでの許可が必要です。",
+                        "睡眠と運動の記録を読むには、ヘルスコネクトでの許可が必要です。\n" +
+                            "「過去のデータへのアクセス」も許可すると、12ヵ月分の月別集計が見られます。",
                         "許可する"
                     ) { requestPermissions.launch(allPerms) }
                     return@launch
                 }
                 showMessage("読み込み中…")
+                hasHistory = granted.contains(historyPerm)
 
+                // 今月を含めて12ヵ月前の1日から
                 val end = Instant.now()
-                val start = LocalDate.now(zone).minusDays(30).atStartOfDay(zone).toInstant()
+                val start = YearMonth.now(zone).minusMonths(11).atDay(1).atStartOfDay(zone).toInstant()
                 val range = TimeRangeFilter.between(start, end)
 
-                val sleeps = readAll(hc, SleepSessionRecord::class, range)
-                val exercises = readAll(hc, ExerciseSessionRecord::class, range)
+                sleeps = readAll(hc, SleepSessionRecord::class, range)
+                exercises = readAll(hc, ExerciseSessionRecord::class, range)
 
-                val distances = mutableMapOf<String, Double>()
+                val dist = mutableMapOf<String, Double>()
                 if (granted.contains(distancePerm)) {
-                    for (ex in exercises) {
+                    for (ex in exercises.filter { hasDistance(it.exerciseType) }) {
                         try {
                             val res = hc.aggregate(
                                 AggregateRequest(
@@ -150,20 +200,24 @@ class MainActivity : ComponentActivity() {
                                 )
                             )
                             val km = res[DistanceRecord.DISTANCE_TOTAL]?.inKilometers
-                            if (km != null && km > 0.05) distances[ex.metadata.id] = km
-                        } catch (e: Exception) { }
+                            if (km != null && km > 0.05) dist[ex.metadata.id] = km
+                        } catch (e: Exception) {
+                            // 距離が取れなくても一覧は表示する
+                        }
                     }
                 }
-                render(sleeps, exercises, distances)
+                distances = dist
+                loaded = true
+                refreshView()
             } catch (e: Exception) {
                 showMessage("読み込みに失敗しました：${e.message}", "もう一度") { loadData() }
             }
         }
     }
 
-    private suspend fun <T : androidx.health.connect.client.records.Record> readAll(
+    private suspend fun <T : Record> readAll(
         hc: HealthConnectClient,
-        type: kotlin.reflect.KClass<T>,
+        type: KClass<T>,
         range: TimeRangeFilter
     ): List<T> {
         val out = mutableListOf<T>()
@@ -178,21 +232,58 @@ class MainActivity : ComponentActivity() {
         return out
     }
 
-    // ---- 表示 ----
+    // ---- 集計 ----
 
-    private fun render(
-        sleeps: List<SleepSessionRecord>,
-        exercises: List<ExerciseSessionRecord>,
-        distances: Map<String, Double>
-    ) {
+    private data class Stats(
+        val nights: Int,
+        val avgSleepMin: Long,
+        val runs: Int,
+        val runKm: Double,
+        val workouts: Int,
+        val workoutMin: Long
+    )
+
+    /** 睡眠は「起きた日」、運動は「始めた日」が from〜to に入るものを集計 */
+    private fun stats(from: LocalDate, to: LocalDate): Stats {
+        fun inRange(d: LocalDate) = !d.isBefore(from) && !d.isAfter(to)
+        val nightsMap = sleeps.filter { inRange(it.endTime.atZone(zone).toLocalDate()) }
+            .groupBy { it.endTime.atZone(zone).toLocalDate() }
+        val sleepTotal = nightsMap.values.sumOf { n -> n.sumOf { asleepMinutes(it) } }
+        val ex = exercises.filter { inRange(it.startTime.atZone(zone).toLocalDate()) }
+        val runs = ex.filter { isRun(it.exerciseType) }
+        return Stats(
+            nights = nightsMap.size,
+            avgSleepMin = if (nightsMap.isEmpty()) 0 else sleepTotal / nightsMap.size,
+            runs = runs.size,
+            runKm = runs.sumOf { distances[it.metadata.id] ?: 0.0 },
+            workouts = ex.size,
+            workoutMin = ex.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
+        )
+    }
+
+    // ---- 日別 ----
+
+    private fun renderDaily() {
         list.removeAllViews()
+        val today = LocalDate.now(zone)
 
-        // 睡眠は「起きた日」、運動は「始めた日」でまとめる
+        // 直近7日と直近30日を並べて表示
+        val s7 = stats(today.minusDays(6), today)
+        val s30 = stats(today.minusDays(29), today)
+        val sum = card()
+        sum.addView(compareRow("", "直近7日", "直近30日", header = true))
+        sum.addView(compareRow("平均睡眠", fmtSleep(s7), fmtSleep(s30)))
+        sum.addView(compareRow("ラン回数", "${s7.runs}回", "${s30.runs}回"))
+        sum.addView(compareRow("ラン距離", fmtKm(s7.runKm), fmtKm(s30.runKm)))
+        sum.addView(compareRow("運動時間", fmtMinutes(s7.workoutMin), fmtMinutes(s30.workoutMin)))
+        list.addView(sum)
+
+        val from = today.minusDays(29)
         val sleepByDay = sleeps.groupBy { it.endTime.atZone(zone).toLocalDate() }
+            .filterKeys { !it.isBefore(from) }
         val exByDay = exercises.groupBy { it.startTime.atZone(zone).toLocalDate() }
+            .filterKeys { !it.isBefore(from) }
         val days = (sleepByDay.keys + exByDay.keys).sortedDescending()
-
-        list.addView(summaryCard(sleeps, exercises, distances))
 
         if (days.isEmpty()) {
             list.addView(note(
@@ -203,56 +294,88 @@ class MainActivity : ComponentActivity() {
         }
 
         for (day in days) {
-            val card = card()
-            card.addView(TextView(this).apply {
+            val c = card()
+            c.addView(TextView(this).apply {
                 text = day.format(dayFmt)
                 textSize = 15f
                 setTypeface(typeface, Typeface.BOLD)
                 setTextColor(mainColor)
             })
-            sleepByDay[day].orEmpty().sortedBy { it.startTime }.forEach { s ->
-                card.addView(sleepRow(s))
+            sleepByDay[day].orEmpty().sortedBy { it.startTime }.forEach { c.addView(sleepRow(it)) }
+            exByDay[day].orEmpty().sortedBy { it.startTime }.forEach {
+                c.addView(exerciseRow(it, distances[it.metadata.id]))
             }
-            exByDay[day].orEmpty().sortedBy { it.startTime }.forEach { e ->
-                card.addView(exerciseRow(e, distances[e.metadata.id]))
-            }
-            list.addView(card)
+            list.addView(c)
         }
     }
 
-    private fun summaryCard(
-        sleeps: List<SleepSessionRecord>,
-        exercises: List<ExerciseSessionRecord>,
-        distances: Map<String, Double>
-    ): View {
-        val weekAgo = Instant.now().minus(7, ChronoUnit.DAYS)
-        val recentSleeps = sleeps.filter { it.endTime.isAfter(weekAgo) }
-        val sleepNights = recentSleeps.groupBy { it.endTime.atZone(zone).toLocalDate() }
-        val avgSleepMin = if (sleepNights.isEmpty()) 0L else
-            sleepNights.values.sumOf { nights -> nights.sumOf { asleepMinutes(it) } } / sleepNights.size
+    // ---- 月別 ----
 
-        val recentRuns = exercises.filter { it.startTime.isAfter(weekAgo) && isRun(it.exerciseType) }
-        val runKm = recentRuns.sumOf { distances[it.metadata.id] ?: 0.0 }
+    private fun renderMonthly() {
+        list.removeAllViews()
+        val thisMonth = YearMonth.now(zone)
+        val today = LocalDate.now(zone)
 
-        val card = card()
-        card.addView(label("直近7日"))
-        card.addView(TextView(this).apply {
-            text = "平均睡眠  " + (if (avgSleepMin > 0) fmtMinutes(avgSleepMin) else "—") +
-                "\nランニング  ${recentRuns.size}回" +
-                (if (runKm > 0) String.format(Locale.JAPAN, "・%.1f km", runKm) else "")
+        if (!hasHistory) {
+            list.addView(note(
+                "30日より前の記録を読む許可がないため、古い月は空になります。",
+            ))
+            list.addView(Button(this).apply {
+                text = "過去データの読み取りを許可"
+                setOnClickListener { requestPermissions.launch(allPerms) }
+            })
+        }
+
+        // 12ヵ月の合計
+        val first = thisMonth.minusMonths(11).atDay(1)
+        val total = stats(first, today)
+        val sum = card()
+        sum.addView(label("過去12ヵ月の合計"))
+        sum.addView(TextView(this).apply {
+            text = "ランニング  ${total.runs}回・${fmtKm(total.runKm)}\n" +
+                "運動  ${total.workouts}回・${fmtMinutes(total.workoutMin)}\n" +
+                "平均睡眠  ${fmtSleep(total)}"
             textSize = 16f
             setTextColor(mainColor)
             setLineSpacing(dp(4).toFloat(), 1f)
         })
-        return card
+        list.addView(sum)
+
+        // 月ごと（新しい月が上）
+        for (i in 0 until 12) {
+            val ym = thisMonth.minusMonths(i.toLong())
+            val to = if (i == 0) today else ym.atEndOfMonth()
+            val s = stats(ym.atDay(1), to)
+            val c = card()
+            c.addView(TextView(this).apply {
+                text = ym.format(monthFmt) + if (i == 0) "（今月）" else ""
+                textSize = 15f
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(mainColor)
+            })
+            if (s.nights == 0 && s.workouts == 0) {
+                c.addView(TextView(this).apply {
+                    text = "記録なし"
+                    textSize = 13f
+                    setTextColor(subColor)
+                    setPadding(0, dp(6), 0, 0)
+                })
+            } else {
+                c.addView(row(runColor, "ラン  ${s.runs}回・${fmtKm(s.runKm)}",
+                    "運動合計 ${s.workouts}回・${fmtMinutes(s.workoutMin)}"))
+                c.addView(row(sleepColor, "睡眠  平均${fmtSleep(s)}",
+                    "記録 ${s.nights}日"))
+            }
+            list.addView(c)
+        }
     }
+
+    // ---- 1件ごとの行 ----
 
     private fun sleepRow(s: SleepSessionRecord): View {
         val start = s.startTime.atZone(zone).format(timeFmt)
         val end = s.endTime.atZone(zone).format(timeFmt)
-        val total = asleepMinutes(s)
-
-        var detail = ""
+        var detail = "$start〜$end"
         if (s.stages.isNotEmpty()) {
             fun m(type: Int) = s.stages.filter { it.stage == type }
                 .sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
@@ -261,27 +384,26 @@ class MainActivity : ComponentActivity() {
             val light = m(SleepSessionRecord.STAGE_TYPE_LIGHT)
             val awake = m(SleepSessionRecord.STAGE_TYPE_AWAKE)
             if (deep + rem + light > 0) {
-                detail = "深い ${fmtMinutes(deep)} ・ レム ${fmtMinutes(rem)} ・ 浅い ${fmtMinutes(light)}" +
+                detail += "\n深い ${fmtMinutes(deep)} ・ レム ${fmtMinutes(rem)} ・ 浅い ${fmtMinutes(light)}" +
                     (if (awake > 0) " ・ 覚醒 ${fmtMinutes(awake)}" else "")
             }
         }
-        return row(sleepColor, "睡眠", "$start〜$end", fmtMinutes(total), detail)
+        return row(sleepColor, "睡眠  ${fmtMinutes(asleepMinutes(s))}", detail)
     }
 
     private fun exerciseRow(e: ExerciseSessionRecord, km: Double?): View {
         val start = e.startTime.atZone(zone).format(timeFmt)
         val end = e.endTime.atZone(zone).format(timeFmt)
         val mins = Duration.between(e.startTime, e.endTime).toMinutes()
-        val name = exerciseName(e.exerciseType)
-        var detail = ""
+        var detail = "$start〜$end"
         if (km != null) {
-            detail = String.format(Locale.JAPAN, "%.2f km", km)
+            detail += "\n" + String.format(Locale.JAPAN, "%.2f km", km)
             if (isRun(e.exerciseType) && km > 0.3) {
                 val paceSec = (Duration.between(e.startTime, e.endTime).seconds / km).toLong()
                 detail += String.format(Locale.JAPAN, " ・ %d'%02d\"/km", paceSec / 60, paceSec % 60)
             }
         }
-        return row(runColor, name, "$start〜$end", fmtMinutes(mins), detail)
+        return row(runColor, "${exerciseName(e.exerciseType)}  ${fmtMinutes(mins)}", detail)
     }
 
     /** 覚醒時間を除いた睡眠時間（段階データがなければ全体） */
@@ -297,6 +419,13 @@ class MainActivity : ComponentActivity() {
     private fun isRun(type: Int) =
         type == ExerciseSessionRecord.EXERCISE_TYPE_RUNNING ||
             type == ExerciseSessionRecord.EXERCISE_TYPE_RUNNING_TREADMILL
+
+    private fun hasDistance(type: Int) = isRun(type) ||
+        type == ExerciseSessionRecord.EXERCISE_TYPE_WALKING ||
+        type == ExerciseSessionRecord.EXERCISE_TYPE_HIKING ||
+        type == ExerciseSessionRecord.EXERCISE_TYPE_BIKING ||
+        type == ExerciseSessionRecord.EXERCISE_TYPE_SWIMMING_POOL ||
+        type == ExerciseSessionRecord.EXERCISE_TYPE_SWIMMING_OPEN_WATER
 
     private fun exerciseName(type: Int): String = when (type) {
         ExerciseSessionRecord.EXERCISE_TYPE_RUNNING -> "ランニング"
@@ -318,9 +447,41 @@ class MainActivity : ComponentActivity() {
     private fun fmtMinutes(min: Long): String =
         if (min >= 60) "${min / 60}時間${min % 60}分" else "${min}分"
 
+    private fun fmtSleep(s: Stats) = if (s.nights > 0) fmtMinutes(s.avgSleepMin) else "—"
+
+    private fun fmtKm(km: Double) = String.format(Locale.JAPAN, "%.1f km", km)
+
     // ---- 部品 ----
 
-    private fun row(color: Int, kind: String, time: String, length: String, detail: String): View {
+    private fun compareRow(name: String, a: String, b: String, header: Boolean = false): View {
+        val r = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(if (header) 0 else 8), 0, dp(if (header) 6 else 0))
+        }
+        fun cell(t: String, weight: Float, color: Int, bold: Boolean, alignEnd: Boolean) =
+            TextView(this).apply {
+                text = t
+                textSize = if (header) 13f else 15f
+                setTextColor(color)
+                if (bold) setTypeface(typeface, Typeface.BOLD)
+                gravity = if (alignEnd) Gravity.END else Gravity.START
+            }.also {
+                r.addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, weight))
+            }
+        cell(name, 1f, subColor, false, false)
+        cell(a, 1.1f, if (header) subColor else mainColor, !header, true)
+        cell(b, 1.1f, if (header) subColor else mainColor, !header, true)
+        if (header) {
+            val wrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            wrap.addView(r)
+            wrap.addView(View(this).apply { setBackgroundColor(lineColor) },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)))
+            return wrap
+        }
+        return r
+    }
+
+    private fun row(color: Int, title: String, detail: String): View {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(10), 0, 0)
@@ -334,13 +495,13 @@ class MainActivity : ComponentActivity() {
         })
         val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         texts.addView(TextView(this).apply {
-            text = "$kind  $length"
+            text = title
             textSize = 16f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(mainColor)
         })
         texts.addView(TextView(this).apply {
-            text = if (detail.isEmpty()) time else "$time\n$detail"
+            text = detail
             textSize = 13f
             setTextColor(subColor)
         })
@@ -392,7 +553,9 @@ class MainActivity : ComponentActivity() {
         )
         try {
             startActivity(Intent(Intent.ACTION_VIEW, uri).setPackage("com.android.vending"))
-        } catch (e: Exception) { }
+        } catch (e: Exception) {
+            // ストアが開けない端末では何もしない
+        }
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
