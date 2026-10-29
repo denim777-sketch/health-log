@@ -199,6 +199,11 @@ class MainActivity : ComponentActivity() {
                 exercises = readAll(hc, ExerciseSessionRecord::class, range)
                 weights = if (hasWeight) readAll(hc, WeightRecord::class, range) else emptyList()
 
+                // 重複を避けるため、データ元を1つに絞る
+                sleeps = onlyFrom(sleeps, SLEEP_EXERCISE_SOURCE) { it.metadata }
+                exercises = onlyFrom(exercises, SLEEP_EXERCISE_SOURCE) { it.metadata }
+                weights = onlyFrom(weights, WEIGHT_SOURCE) { it.metadata }
+
                 val dist = mutableMapOf<String, Double>()
                 if (granted.contains(distancePerm)) {
                     for (ex in exercises.filter { hasDistance(it.exerciseType) }) {
@@ -443,10 +448,21 @@ class MainActivity : ComponentActivity() {
         return row(weightColor, "体重  ${fmtKg(w.weight.inKilograms)}", "$t\n" + sourceName(w.metadata))
     }
 
+    /**
+     * 指定したアプリ（名前で指定）の記録だけを残す。
+     * そのアプリの記録が1件もない場合は、何も表示されなくなるのを避けるため全件を残す。
+     */
+    private fun <T> onlyFrom(records: List<T>, appName: String, meta: (T) -> Metadata): List<T> {
+        val picked = records.filter { appLabel(meta(it)).equals(appName, ignoreCase = true) }
+        return if (picked.isEmpty()) records else picked
+    }
+
+    private fun sourceName(m: Metadata) = "データ元：" + appLabel(m)
+
     /** 記録を書き込んだアプリの名前（分からなければパッケージ名） */
-    private fun sourceName(m: Metadata): String {
+    private fun appLabel(m: Metadata): String {
         val pkg = m.dataOrigin.packageName
-        val name = sourceNames.getOrPut(pkg) {
+        return sourceNames.getOrPut(pkg) {
             try {
                 val info = packageManager.getApplicationInfo(pkg, 0)
                 packageManager.getApplicationLabel(info).toString()
@@ -454,7 +470,12 @@ class MainActivity : ComponentActivity() {
                 pkg
             }
         }
-        return "データ元：$name"
+    }
+
+    companion object {
+        // 使うデータ元のアプリ名（データ元の表示と同じ名前）
+        const val SLEEP_EXERCISE_SOURCE = "Health"
+        const val WEIGHT_SOURCE = "HealthPlanet"
     }
 
     /** 覚醒時間を除いた睡眠時間（段階データがなければ全体） */
