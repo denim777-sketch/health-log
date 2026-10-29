@@ -67,6 +67,8 @@ class MainActivity : ComponentActivity() {
     private var weights: List<WeightRecord> = emptyList()
     private var hasHistory = true
     private var hasWeight = true
+    private var hasDistancePerm = true
+    private var distanceError: String? = null
     private val sourceNames = mutableMapOf<String, String>()
     private var loaded = false
     private var showMonthly = false
@@ -189,6 +191,7 @@ class MainActivity : ComponentActivity() {
                 showMessage("読み込み中…")
                 hasHistory = granted.contains(historyPerm)
                 hasWeight = granted.contains(weightPerm)
+                hasDistancePerm = granted.contains(distancePerm)
 
                 // 今月を含めて12ヵ月前の1日から
                 val end = Instant.now()
@@ -204,9 +207,19 @@ class MainActivity : ComponentActivity() {
                 exercises = onlyFrom(exercises, SLEEP_EXERCISE_SOURCE) { it.metadata }
                 weights = onlyFrom(weights, WEIGHT_SOURCE) { it.metadata }
 
+                // 距離は1件ずつ問い合わせるため、件数を絞る（多すぎると回数制限にかかる）
+                //   ・ランニング：12ヵ月分すべて（月別集計に使う）
+                //   ・その他の距離がある運動：直近30日分だけ（日別表示に使う）
                 val dist = mutableMapOf<String, Double>()
-                if (granted.contains(distancePerm)) {
-                    for (ex in exercises.filter { hasDistance(it.exerciseType) }) {
+                var failures = 0
+                var lastError: String? = null
+                if (hasDistancePerm) {
+                    val recentFrom = Instant.now().minus(Duration.ofDays(31))
+                    val targets = exercises.filter {
+                        isRun(it.exerciseType) ||
+                            (hasDistance(it.exerciseType) && it.startTime.isAfter(recentFrom))
+                    }.sortedByDescending { it.startTime }
+                    for (ex in targets) {
                         try {
                             val res = hc.aggregate(
                                 AggregateRequest(
@@ -217,10 +230,13 @@ class MainActivity : ComponentActivity() {
                             val km = res[DistanceRecord.DISTANCE_TOTAL]?.inKilometers
                             if (km != null && km > 0.05) dist[ex.metadata.id] = km
                         } catch (e: Exception) {
-                            // 距離が取れなくても一覧は表示する
+                            // 距離が取れなくても一覧は表示する（原因は画面に出す）
+                            failures++
+                            lastError = e.message ?: e.javaClass.simpleName
                         }
                     }
                 }
+                distanceError = if (failures > 0) "距離の取得に${failures}件失敗：$lastError" else null
                 distances = dist
                 loaded = true
                 refreshView()
@@ -297,9 +313,11 @@ class MainActivity : ComponentActivity() {
         sum.addView(compareRow("平均体重", fmtKg(s7.avgWeight), fmtKg(s30.avgWeight)))
         list.addView(sum)
 
-        if (!hasWeight) {
+        distanceError?.let { list.addView(note(it).apply { textSize = 12f; setTextColor(subColor) }) }
+
+        if (!hasWeight || !hasDistancePerm) {
             list.addView(Button(this).apply {
-                text = "体重の読み取りを許可"
+                text = if (!hasDistancePerm) "距離の読み取りを許可" else "体重の読み取りを許可"
                 setOnClickListener { requestPermissions.launch(allPerms) }
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
